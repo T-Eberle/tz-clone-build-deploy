@@ -1,0 +1,425 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: tz-clone-build-deploy
+  namespace: default
+  labels:
+    app: tz-clone-build-deploy
+spec:
+  params:
+    - name: name
+      type: string
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc.cluster.local:5000"
+    - name: ghe-ssh-url
+      type: string
+    - name: enable-build
+      type: string
+      default: true
+    - name: enable-deployment
+      type: string
+      default: true
+    - name: ghe-branch
+      type: string
+      default: main
+    - name: create-trigger
+      type: string
+      default: "true"
+    - name: build-extra-build-args
+      type: string
+      default: ""
+    - name: build-extra-push-args
+      type: string
+      default: ""
+    - name: ghe-webhook-api-key-secret-name
+      type: string
+      default: ""
+      description: |
+        The secret name containing a personal token in Github Enterprise defined with the key "api-key".
+        IMPORTANT: In order to run the pipeline with this parameter set, the secret must exist in advance.
+        Create it either over the Openshift Console UI or with the following command: 
+        'oc create secret generic -n default #NAME_OF_SECRET --from-literal=api-key=#YOUR_API_KEY'
+    - name: ghe-webhook-owner-repo-slug
+      type: string
+      default: ""
+    - name: build-context
+      type: string
+      default: "./"
+    - name: build-dockerfile
+      default: "./Dockerfile"
+    - name: deploy-kustomize-directory
+      type: string
+      default: "deployment"
+    - name: target-namespace
+      type: string
+      default: "default"
+    - name: openshift-version
+      type: string
+      default: "4.7"
+    - name: pipelineruns-to-keep
+      type: string
+      default: 3
+  workspaces:
+    - name: output
+      optional: false
+    - name: ssh-directory
+      optional: false
+  tasks:
+  - name: prepare-project
+    taskRef:
+      name: openshift-client
+    params:
+    - name: VERSION
+      value: $(params.openshift-version)
+    - name: SCRIPT
+      value: |
+        oc new-project $(params.target-namespace) || oc project $(params.target-namespace)
+        oc policy add-role-to-user system:image-builder system:serviceaccount:default:pipeline -n $(params.target-namespace)   
+  - name: create-trigger
+    taskSpec:
+        params:
+        - name: openshift-version
+          type: string
+        - name: name
+          type: string
+        - name: ghe-ssh-url
+          type: string
+        - name: ghe-branch
+          type: string
+        - name: build-context
+          type: string
+        - name: build-dockerfile
+          type: string
+        - name: target-namespace
+          type: string
+        - name: deploy-kustomize-directory
+          type: string
+        - name: image-registry
+          type: string
+        - name: enable-build
+          type: string
+        - name: enable-deployment
+          type: string
+        - name: pipelineruns-to-keep
+          type: string
+        - name: build-extra-build-args
+          type: string
+        - name: build-extra-push-args
+          type: string
+        steps:
+        - computeResources: {}
+          image: quay.io/openshift/origin-cli:$(params.openshift-version)
+          name: oc
+          script: |
+            #!/usr/bin/env bash
+            dollar="$"
+
+            cd $(workspaces.manifest-dir.path)
+
+            cat <<EOF | oc apply -f -
+            apiVersion: v1
+            kind: ServiceAccount
+            metadata:
+              name: tekton-robot
+            ---
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: RoleBinding
+            metadata:
+              name: triggers-example-eventlistener-binding
+            subjects:
+            - kind: ServiceAccount
+              name: tekton-robot
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: tekton-triggers-eventlistener-roles
+            ---
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRoleBinding
+            metadata:
+              name: triggers-example-eventlistener-clusterbinding
+            subjects:
+            - kind: ServiceAccount
+              name: tekton-robot
+              namespace: default
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: tekton-triggers-eventlistener-clusterroles
+            EOF
+
+            cat <<EOF | oc apply -f -
+            apiVersion: triggers.tekton.dev/v1beta1
+            kind: TriggerTemplate
+            metadata:
+              name: $(params.name)-template
+              labels:
+                app: $(context.pipeline.name)
+                ce.ibm/project-name: $(params.name)
+            spec:
+              resourcetemplates:
+              - apiVersion: tekton.dev/v1
+                kind: PipelineRun
+                metadata:
+                  generateName: $(context.pipeline.name)-$(params.name)-
+                  namespace: default
+                  labels:
+                    app: $(context.pipeline.name)
+                    ce.ibm/project-name: $(params.name)
+                spec:
+                  pipelineRef:
+                    name: $(context.pipeline.name)
+                  taskRunTemplate:
+                    serviceAccountName: pipeline
+                    podTemplate:
+                      securityContext:
+                        fsGroup: 65532
+                  params:
+                  - name: name
+                    value: $(params.name)
+                  - name: ghe-ssh-url
+                    value: $(params.ghe-ssh-url)
+                  - name: ghe-branch
+                    value: $(params.ghe-branch)
+                  - name: create-trigger
+                    value: "false"
+                  - name: build-context
+                    value: $(params.build-context)
+                  - name: build-dockerfile
+                    value: $(params.build-dockerfile)
+                  - name: target-namespace
+                    value: $(params.target-namespace)
+                  - name: deploy-kustomize-directory
+                    value: $(params.deploy-kustomize-directory)
+                  - name: image-registry
+                    value: $(params.image-registry)
+                  - name: openshift-version
+                    value: $(params.openshift-version)
+                  - name: enable-build
+                    value: $(params.enable-build)
+                  - name: enable-deployment
+                    value: $(params.enable-deployment)
+                  - name: pipelineruns-to-keep
+                    value: $(params.pipelineruns-to-keep)
+                  - name: build-extra-build-args
+                    value: $(params.build-extra-build-args)
+                  - name: build-extra-push-args
+                    value: $(params.build-extra-push-args)
+                  workspaces:
+                    - name: output
+                      volumeClaimTemplate:
+                        metadata:
+                          creationTimestamp: null
+                        spec:
+                          accessModes:
+                            - ReadWriteOnce
+                          resources:
+                            requests:
+                              storage: 1Gi
+                          storageClassName: ocs-storagecluster-cephfs
+                          volumeMode: Filesystem
+                        status: {}
+                    - name: ssh-directory
+                      secret:
+                        secretName: ssh-ghe-private-key
+            EOF
+
+            cat <<EOF | oc apply -f -
+            apiVersion: triggers.tekton.dev/v1beta1
+            kind: EventListener
+            metadata:
+              name: $(params.name)-listener
+              labels:
+                ce.ibm/project-name: $(params.name)
+            spec:
+              serviceAccountName: tekton-robot
+              triggers:
+   
+                - name: $(params.name)-trigger
+                  bindings:
+                  - name: gitrevision
+                    value: ${dollar}(body.head_commit.id)
+                  - name: gitrepositoryurl
+                    value: ${dollar}(body.repository.url)
+                  interceptors:
+                  - ref:
+                      name: cel
+                    params:
+                    - name: filter
+                      value: body.ref.contains('$(params.ghe-branch)')
+                    - name: overlays
+                      value:
+                      - key: branch
+                        expression: body.ref.split('/')[2] 
+                  template:
+                    ref: $(params.name)-template
+            EOF
+
+
+            oc get el $(params.name)-listener -o=jsonpath='{.status.configuration.generatedName}' > /tmp/el_name.txt
+            oc delete route $(cat /tmp/el_name.txt)
+            oc create route edge $(cat /tmp/el_name.txt) --service=$(cat /tmp/el_name.txt) --insecure-policy='Redirect' --port=8080 -n default
+            oc get route -n default $(cat /tmp/el_name.txt) -o=jsonpath='{ .spec.host }' > $(results.route-host.path)
+        results:
+        - name: route-host
+        workspaces:
+        - name: manifest-dir
+    when:
+    - input: $(params.create-trigger)
+      operator: in
+      values: ["true"]
+    workspaces:
+    - name: manifest-dir
+      workspace: output
+    params: 
+    - name: name
+      value: $(params.name)
+    - name: build-context
+      value: $(params.build-context)
+    - name: ghe-branch
+      value: $(params.ghe-branch)
+    - name: ghe-ssh-url
+      value: $(params.ghe-ssh-url)
+    - name: build-dockerfile
+      value: $(params.build-dockerfile)
+    - name: target-namespace
+      value: $(params.target-namespace)
+    - name: deploy-kustomize-directory
+      value: $(params.deploy-kustomize-directory)
+    - name: image-registry
+      value: $(params.image-registry)
+    - name: openshift-version
+      value: $(params.openshift-version)
+    - name: enable-build
+      value: $(params.enable-build)
+    - name: enable-deployment
+      value: $(params.enable-deployment)
+    - name: pipelineruns-to-keep
+      value: $(params.pipelineruns-to-keep)
+    - name: build-extra-build-args
+      value: $(params.build-extra-build-args)
+    - name: build-extra-push-args
+      value: $(params.build-extra-push-args)
+  - name: ghe-webhook
+    runAfter:
+    - create-trigger
+    when:
+    - input: $(params.ghe-webhook-api-key-secret-name)
+      operator: notin
+      values: [""]
+    - input: $(params.ghe-webhook-owner-repo-slug)
+      operator: notin
+      values: [""]
+    taskSpec:
+            steps:
+            - computeResources: {}
+              env:
+              - name: HOME
+                value: /tekton/home
+              - name: APIKEY
+                valueFrom:
+                  secretKeyRef:
+                    name: $(params.ghe-webhook-api-key-secret-name)
+                    key: api-key
+              image: registry.access.redhat.com/ubi9/ubi-minimal:9.4-1194
+              name: script
+              script: |
+                #!/bin/bash
+                echo "Set up Github Enterprise Webhook"
+                curl -L \
+                      -X POST \
+                      -H "Accept: application/vnd.github+json" \
+                      -H "Authorization: Bearer $APIKEY" \
+                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                      https://api.github.ibm.com/repos/$(params.ghe-webhook-owner-repo-slug)/hooks \
+                      -d '{"name":"web","active":true,"events":["push","pull_request"],"config":{"url":"https://$(tasks.create-trigger.results.route-host)","content_type":"json","insecure_ssl":"0"}}'
+            params:
+            - name: ghe-webhook-owner-repo-slug
+              type: string
+              default: ""
+            - name: ghe-webhook-api-key-secret-name
+              type: string
+              default: ""
+    params:
+    - name: ghe-webhook-owner-repo-slug
+      value: $(params.ghe-webhook-owner-repo-slug)
+    - name: ghe-webhook-api-key-secret-name
+      value: $(params.ghe-webhook-api-key-secret-name)
+  - name: git-clone
+    taskRef:
+      name: git-clone
+      kind: ClusterTask
+    runAfter:
+    - create-trigger
+    params:
+      - name: url
+        value: $(params.ghe-ssh-url)
+      - name: branch
+        value: $(params.ghe-branch)
+    workspaces:
+    - name: output
+      workspace: output
+    - name: ssh-directory
+      workspace: ssh-directory
+  - name: build
+    runAfter:
+    - git-clone
+    - prepare-project
+    when:
+    - input: $(params.enable-build)
+      operator: in
+      values: ["true"]    
+    taskRef:
+      name: buildah
+      kind: ClusterTask
+    params:
+      - name: DOCKERFILE
+        value: $(params.build-dockerfile)
+      - name: CONTEXT
+        value: $(params.build-context)
+      - name: IMAGE
+        value: $(params.image-registry)/$(params.target-namespace)/$(params.name):latest
+      - name: TLSVERIFY
+        value: false
+      - name: BUILD_EXTRA_ARGS
+        value: $(params.build-extra-build-args)
+      - name: PUSH_EXTRA_ARGS
+        value: $(params.build-extra-push-args)
+    workspaces:
+      - name: source
+        workspace: output
+  - name: deploy
+    when:
+    - input: $(params.enable-deployment)
+      operator: in
+      values: ["true"]    
+    runAfter: 
+    - build
+    taskRef:
+      name: openshift-client
+    params: 
+      - name: SCRIPT
+        value: |
+          oc new-project $(params.target-namespace) || oc project $(params.target-namespace)
+          oc apply -k $(params.deploy-kustomize-directory) -n $(params.target-namespace)
+    workspaces:
+    - name: manifest-dir
+      workspace: output
+  finally:
+  - name: clean-up
+    taskRef:
+      name: openshift-client
+    params:
+    - name: VERSION
+      value: $(params.openshift-version)
+    - name: SCRIPT
+      value: |
+        while read -r PIPELINE_TO_REMOVE; do
+          test -n "${PIPELINE_TO_REMOVE}" || continue;
+          oc delete ${PIPELINE_TO_REMOVE} -n default \
+              && echo "PipelineRun ${PIPELINE_TO_REMOVE} deleted." \
+              || echo "Unable to delete PipelineRun ${PIPELINE_TO_REMOVE}.";
+        done < <(oc get pipelinerun -n default -l tekton.dev/pipeline=$(context.pipeline.name) \
+          -l ce.ibm/project-name=$(params.name) \
+          --sort-by=.metadata.creationTimestamp -o name | head -n -$(params.pipelineruns-to-keep));
